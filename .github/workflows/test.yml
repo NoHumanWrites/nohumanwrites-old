@@ -16,4 +16,5 @@ jobs:
       - run: python3 -m py_compile nohumanwrites.py cli.py nhw/*.py
       - run: python3 tests/test_ledger.py
       - run: python3 tests/test_creative.py
+      - run: python3 tests/test_web.py
       - run: python3 nohumanwrites.py check . --json > /dev/null

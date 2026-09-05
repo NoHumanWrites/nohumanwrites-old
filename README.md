@@ -36,6 +36,20 @@ python3 nohumanwrites.py import song.txt --from suno --clipboard  # save the cli
 python3 nohumanwrites.py check chapter1.md    # → 14 paragraphs: 11 attested, 2 edited, 1 unattested (paragraph 9)
 ```
 
+### Published pages, LinkedIn, podcasts, streamed tracks
+
+Point `check` at a URL and it prints a **provenance card**: what the platform *declares* (author, date, generator, any AI-disclosure wording, Content Credentials on the lead image or in the audio) in one column, and what is *verifiable against your ledger* in the other.
+
+```bash
+python3 nohumanwrites.py import linkedin-draft.md --from claude.ai      # sign the draft the AI gave you
+# ... you rewrite paragraph 2, add a closing line, publish ...
+python3 nohumanwrites.py check https://www.linkedin.com/posts/...  --repo ~/posts
+#   4 paragraph(s): 2 attested (signed before publishing), 1 edited, 1 unattested
+#   paragraph 2: edited · paragraph 4: unattested
+```
+
+LinkedIn shows a login wall to anonymous readers, so for LinkedIn save the post page from your browser and run `check saved-post.html --repo ~/posts`; Medium, Substack and ordinary blogs work from the URL. A podcast RSS feed gets a per-episode card (disclosure wording, C2PA in the first 2 MB of audio, transcript link) and, when a transcript exists, the transcript matched against the script you signed before recording. A Spotify track gets a card of declared credits versus the empty verifiable column that a stream necessarily has.
+
 What this cannot do, on purpose: look at a poem nobody signed and tell you whether a person wrote it. Nothing can (paper §6). It tells you what changed after the machine's version was signed, which is the question a publisher, a co-writer or a rights holder can act on.
 
 Keep the number in a pull request with a two-line GitHub Action:

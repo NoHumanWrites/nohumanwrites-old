@@ -9,6 +9,13 @@
   python3 nohumanwrites.py check <path> --signers FILE  use this allowed-signers file
   python3 nohumanwrites.py check <path> --trust-repo-signers   accept the repository's own keys (prints a warning)
   python3 nohumanwrites.py check <path> --profile prose|verse|abc|musicxml|code   override the auto-detected unit
+  python3 nohumanwrites.py check <web-url> [--repo DIR]  provenance card for a published page (LinkedIn, Medium, a blog):
+                                                        declared author/date/disclosure, Content Credentials on the lead
+                                                        image, and its paragraphs matched against your ledger
+  python3 nohumanwrites.py check <podcast-rss-url> [--repo DIR]   provenance card for a podcast: per-episode disclosure,
+                                                        C2PA in the audio, transcript matched against a signed script
+  python3 nohumanwrites.py check <spotify-track-url>    provenance card for a streamed track (declared vs verifiable)
+  python3 nohumanwrites.py check saved.html --repo DIR  same as the web card, for a page saved from the browser (LinkedIn)
   python3 nohumanwrites.py import <file> --from claude.ai     sign a text you received from an AI elsewhere, as received
   python3 nohumanwrites.py import <file> --from chatgpt --clipboard   same, saving the clipboard into <file> first
   python3 nohumanwrites.py setup                        create the signing key + install the Claude Code hook
@@ -294,21 +301,178 @@ def stream_card(url):
     return 3
 
 
+def _fetch(url, limit=8_000_000, headers=None):
+    import urllib.request
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; NoHumanWrites/0.1)", **(headers or {})})
+    with urllib.request.urlopen(req, timeout=25) as r:
+        return r.read(limit), r.headers.get("Content-Type", ""), r.geturl()
+
+
+def html_to_parts(page):
+    """→ (meta dict, [paragraph texts]) from an HTML page: title, author/date/generator metas, JSON-LD author,
+    og:image, AI-disclosure hints, and the paragraphs of the main article (or body)."""
+    import html as h, re
+    meta = {}
+    def m(pattern):
+        x = re.search(pattern, page, re.I | re.S); return h.unescape(x.group(1)).strip() if x else None
+    meta["title"] = m(r"<title[^>]*>(.*?)</title>") or m(r'property="og:title" content="([^"]*)"')
+    meta["author"] = m(r'name="author" content="([^"]*)"') or m(r'property="article:author" content="([^"]*)"')
+    meta["published"] = m(r'property="article:published_time" content="([^"]*)"') or m(r'name="date" content="([^"]*)"')
+    meta["generator"] = m(r'name="generator" content="([^"]*)"')
+    meta["og_image"] = m(r'property="og:image" content="([^"]*)"')
+    for ld in re.findall(r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>', page, re.I | re.S):
+        try:
+            d = json.loads(ld); d = d if isinstance(d, dict) else (d[0] if d else {})
+            a = d.get("author") or d.get("creator")
+            if a and not meta.get("author"):
+                meta["author"] = ", ".join(x.get("name", "") for x in (a if isinstance(a, list) else [a]) if isinstance(x, dict)) or str(a)
+            if d.get("datePublished") and not meta.get("published"):
+                meta["published"] = d["datePublished"]
+            for k in ("creditText", "creativeWorkStatus", "isBasedOn"):
+                if d.get(k): meta[k] = str(d[k])[:120]
+        except Exception:
+            pass
+    disc = re.findall(r"(?i)(AI[- ]generated|generated (?:with|by) (?:AI|an AI|artificial intelligence)|written with (?:the help of )?AI|content credentials|trainedAlgorithmicMedia|compositeWithTrainedAlgorithmicMedia)", page)
+    meta["ai_disclosure_hints"] = sorted(set(x if isinstance(x, str) else x[0] for x in disc))[:5]
+    body = re.search(r"<article\b.*?</article>", page, re.I | re.S)
+    body = body.group(0) if body else page
+    body = re.sub(r"<(script|style|nav|footer|header|aside)\b.*?</\1>", " ", body, flags=re.I | re.S)
+    paras = []
+    for p in re.findall(r"<(?:p|h1|h2|h3|li|blockquote)\b[^>]*>(.*?)</(?:p|h1|h2|h3|li|blockquote)>", body, re.I | re.S):
+        t = h.unescape(re.sub(r"<[^>]+>", " ", p)); t = " ".join(t.split())
+        if len(t) >= 25:
+            paras.append(t)
+    if len(paras) < 2:                                     # fallback: text blocks split on double breaks
+        t = h.unescape(re.sub(r"<[^>]+>", "\n", body))
+        paras = [" ".join(x.split()) for x in re.split(r"\n\s*\n", t) if len(" ".join(x.split())) >= 40]
+    return meta, paras
+
+
+def web_card(url, repo=None, explicit=None, trust_repo=False):
+    """Provenance card for a published web page (LinkedIn/Medium/Substack/blog): declared metadata, disclosure
+    hints, Content Credentials on the lead image, and — the part that means something — its paragraphs matched
+    against your ledger, so a post you signed before publishing shows what changed."""
+    try:
+        raw, ctype, final = _fetch(url)
+    except Exception as e:
+        print(f"could not fetch the page: {e}"); return 1
+    page = raw.decode("utf-8", "replace")
+    if "linkedin.com" in final and ("authwall" in final or "Sign In" in page[:20000] or "login" in final):
+        print("LinkedIn shows a login wall to anonymous readers. Save the post page from your browser (File → Save) and run:")
+        print("  python3 nohumanwrites.py check saved-post.html --repo <folder with your .nhw ledger>"); return 2
+    if "xml" in ctype or page.lstrip().startswith("<?xml") or "<rss" in page[:2000] or "<feed" in page[:2000]:
+        return podcast_card(page, final, repo, explicit, trust_repo)
+    meta, paras = html_to_parts(page)
+    return _web_report(final, meta, paras, repo, explicit, trust_repo)
+
+
+def _web_report(final, meta, paras, repo, explicit, trust_repo):
+    print("NoHumanWrites — provenance card for a published page")
+    print(f"  {meta.get('title') or final}")
+    print("  DECLARED (claims, not provenance):")
+    for k in ("author", "published", "generator", "creditText", "creativeWorkStatus"):
+        if meta.get(k): print(f"    {k:13s} {meta[k]}")
+    print(f"    disclosure    " + (", ".join(meta["ai_disclosure_hints"]) if meta.get("ai_disclosure_hints") else "no AI-disclosure wording or credential tags found on the page"))
+    if meta.get("og_image"):
+        try:
+            img, _, _ = _fetch(meta["og_image"])
+            cc = any(x in img for x in (b"c2pa", b"contentauth", b"jumb\x00\x00\x00", b"C2PA", b"trainedAlgorithmicMedia"))
+            print(f"    lead image    " + ("carries a C2PA / IPTC provenance marker (verify with c2patool)" if cc else "no Content Credentials"))
+        except Exception:
+            pass
+    print("  VERIFIABLE against your ledger:")
+    records, malformed = verify.load_ledger(repo) if repo else ([], 0)
+    if not paras:
+        print("    no readable paragraphs on the page"); return 3
+    if not records:
+        print(f"    {len(paras)} paragraph(s) on the page, no ledger to compare with (pass --repo <folder with .nhw/>) → no provenance"); return 3
+    signers, src = verify.allowed_signers(repo, explicit, trust_repo)
+    fps = verify.fingerprints(signers) if signers else {}
+    labels, status, ver, unver = verify.unit_coverage("\n\n".join(paras), "prose", records, signers, fps, None)
+    if ver == 0 and unver > 0:
+        print("    ledger records exist but none verify with your keys → unverifiable"); return 4
+    att = status.count("attested"); ed = status.count("edited"); un = status.count("unattested")
+    print(f"    {len(labels)} paragraph(s): {att} attested (signed before publishing), {ed} edited, {un} unattested")
+    for l, s in zip(labels, status):
+        if s != "attested": print(f"      {l}: {s}")
+    print("  Verdict: " + ("every paragraph carries provenance from your signed draft." if un == 0 and ed == 0 else
+                          "the unattested / edited paragraphs were changed or added after the signed draft; nothing here says by whom."))
+    return 0
+
+
+def podcast_card(xml, final, repo=None, explicit=None, trust_repo=False):
+    """Provenance card for a podcast feed: declared metadata, per-episode transcript links, C2PA presence in the
+    audio, and transcripts matched against your ledger (a script signed before recording)."""
+    import html as h, re
+    def m(pat, s=xml):
+        x = re.search(pat, s, re.I | re.S); return h.unescape(x.group(1)).strip() if x else None
+    print("NoHumanWrites — provenance card for a podcast feed")
+    print(f"  {m(r'<channel>.*?<title>(.*?)</title>') or m(r'<feed.*?<title[^>]*>(.*?)</title>') or final}")
+    print("  DECLARED (claims, not provenance):")
+    for k, pat in (("author", r"<itunes:author>(.*?)</itunes:author>"), ("owner", r"<itunes:email>(.*?)</itunes:email>"),
+                   ("generator", r"<generator>(.*?)</generator>"), ("guid/host", r"<podcast:person[^>]*>(.*?)</podcast:person>")):
+        v = m(pat)
+        if v: print(f"    {k:13s} {v[:100]}")
+    items = re.findall(r"<item>(.*?)</item>", xml, re.I | re.S)[:3]
+    print(f"    episodes      {len(re.findall(r'<item>', xml, re.I))} in feed; checking the latest {len(items)}")
+    records, malformed = verify.load_ledger(repo) if repo else ([], 0)
+    signers, src = verify.allowed_signers(repo, explicit, trust_repo) if repo else (None, "none")
+    fps = verify.fingerprints(signers) if signers else {}
+    for it in items:
+        title = m(r"<title>(.*?)</title>", it) or "(untitled)"
+        enc = m(r'<enclosure[^>]*url="([^"]+)"', it)
+        tr = re.findall(r'<podcast:transcript[^>]*url="([^"]+)"', it, re.I)
+        ai = re.findall(r"(?i)(AI[- ]generated|generated (?:with|by) AI|synthetic voice|text-to-speech|<podcast:txt[^>]*>)", it)
+        print(f"  — {title[:70]}")
+        if enc:
+            try:
+                head, _, _ = _fetch(enc, limit=2_000_000, headers={"Range": "bytes=0-1999999"})
+                cc = any(x in head for x in (b"c2pa", b"contentauth", b"jumb\x00\x00\x00", b"C2PA"))
+                print("      audio        " + ("carries a C2PA marker in its first 2 MB (verify with c2patool)" if cc else "no Content Credentials in the first 2 MB"))
+            except Exception:
+                print("      audio        enclosure not fetchable")
+        print("      disclosure   " + (", ".join(sorted(set(a if isinstance(a, str) else a[0] for a in ai)))[:120] if ai else "none in the episode metadata"))
+        if tr:
+            print(f"      transcript   {tr[0][:90]}")
+            if records:
+                try:
+                    t, _, _ = _fetch(tr[0]); text = t.decode("utf-8", "replace")
+                    text = re.sub(r"<[^>]+>", " ", text) if "<" in text[:200] else text
+                    text = re.sub(r"^\d+\s*$|^\d\d:\d\d:\d\d[^\n]*$", "", text, flags=re.M)
+                    labels, status, ver, unver = verify.unit_coverage(text, "prose", records, signers, fps, None)
+                    if labels:
+                        print(f"      vs ledger    {status.count('attested')} attested / {status.count('edited')} edited / {status.count('unattested')} unattested paragraph(s) "
+                              f"(transcripts are noisy: only exact sentence matches count)")
+                except Exception:
+                    print("      vs ledger    transcript not fetchable")
+        else:
+            print("      transcript   none published — nothing to match against a signed script")
+    print("  VERIFIABLE: only what the rows above say. A voice cannot be attested by this tool; a script can, if it was signed before recording.")
+    return 0
+
+
 def _opt(args, name):
     return args[args.index(name) + 1] if name in args and args.index(name) + 1 < len(args) else None
 
 
 def cmd_check(args):
     flags = {a for a in args if a.startswith("--")}
-    explicit = _opt(args, "--signers"); profile = _opt(args, "--profile")
-    skip = {"--signers", "--profile"}
+    explicit = _opt(args, "--signers"); profile = _opt(args, "--profile"); repo_opt = _opt(args, "--repo")
+    skip = {"--signers", "--profile", "--repo"}
     paths = [a for i, a in enumerate(args) if not a.startswith("--") and not (i > 0 and args[i - 1] in skip)] or ["."]
+    ledger_repo = repo_root(repo_opt) if repo_opt else None
     if len(paths) == 1 and paths[0].startswith(("http://", "https://")):
-        return stream_card(paths[0])
+        if "open.spotify.com/" in paths[0]:
+            return stream_card(paths[0])
+        return web_card(paths[0], ledger_repo or repo_root(os.getcwd()), explicit, "--trust-repo-signers" in flags)
     files, docs, media = list_files(paths)
     if not files and not docs and not media:
         print("nothing to check (no readable files)"); return 2
-    repo = repo_root(paths[0])
+    # a saved web page (.html/.htm) is read like a published page: paragraphs against the ledger
+    if len(files) == 1 and files[0].lower().endswith((".html", ".htm")) and (ledger_repo or not repo_root(files[0])):
+        meta, paras = html_to_parts(read_text(files[0]) or "")
+        return _web_report(files[0], meta, paras, ledger_repo or repo_root(os.getcwd()), explicit, "--trust-repo-signers" in flags)
+    repo = ledger_repo or repo_root(paths[0])
     res = None if "--transcripts" in flags else (check_ledger(repo, files, docs, explicit, "--trust-repo-signers" in flags, profile) if repo else None)
     if res is None:
         res = check_transcripts(files)
